@@ -1,0 +1,305 @@
+import os
+import random
+import joblib
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import lightgbm as lgb
+from pathlib import Path
+import datetime as dt
+from re import search
+import matplotlib.pyplot as plt
+import plotly.express as px
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_log_error
+import warnings
+warnings.filterwarnings('ignore')
+
+random.seed(333)
+
+
+# Load data
+train = pd.read_csv('/kaggle/input/store-sales-time-series-forecasting/train.csv')
+test = pd.read_csv('/kaggle/input/store-sales-time-series-forecasting/test.csv')
+holidays = pd.read_csv('/kaggle/input/store-sales-time-series-forecasting/holidays_events.csv')
+oil = pd.read_csv('/kaggle/input/store-sales-time-series-forecasting/oil.csv')
+stores= pd.read_csv('/kaggle/input/store-sales-time-series-forecasting/stores.csv')
+transactions = pd.read_csv('/kaggle/input/store-sales-time-series-forecasting/transactions.csv')
+#EDA
+# To see the first 5 rows
+print(train.head())
+# To see the last 5 rows
+print(train.tail())
+
+# To check if there are any missing values in the data
+print(train.info())
+print(train.isnull().sum())
+
+# To see the first 5 rows
+print(test.head())
+# To see the last 5 rows
+print(test.tail())
+
+# To check if there are any missing values in the data
+print(test.info())
+print(test.isnull().sum())
+sales_over_time = train.groupby('date')['sales'].sum().reset_index()
+
+# Create an interactive line plot using Plotly
+fig = px.line(sales_over_time, x='date', y='sales',
+              title='Sales Over Time',
+              labels={'sales': 'Total Sales', 'date': 'Date'})
+
+# Show the plot
+fig.show()
+# Ensure 'date' column is of datetime type
+transactions['date'] = pd.to_datetime(transactions['date'])
+
+# Group by date and sum the transactions
+daily_transactions = transactions.groupby('date').transactions.sum().reset_index()
+
+# Sort the dataframe by date in ascending order
+daily_transactions = daily_transactions.sort_values(by='date', ascending=True)
+
+# Add day of the week column
+daily_transactions['day_of_week'] = daily_transactions['date'].dt.day_name()
+
+# Create a custom hover column for better tooltips in the plot
+daily_transactions['hover_text'] = daily_transactions['date'].dt.strftime('%Y-%m-%d') + " (" + daily_transactions['day_of_week'] + "): " + daily_transactions['transactions'].astype(str)
+
+# Create an interactive line plot using Plotly
+fig = px.line(daily_transactions, x='date', y='transactions',
+              title='Transactions Trend Across All Stores by Date',
+              hover_name='hover_text')  # Use the custom hover column
+
+fig.show()
+holidays['date'] = pd.to_datetime(holidays['date'])
+train['date'] = pd.to_datetime(train['date'])
+oil['date'] = pd.to_datetime(oil['date'])
+
+# Check for existing 'holiday_flag' columns and remove them to avoid duplication
+duplicate_columns = [col for col in train.columns if 'holiday_flag' in col]
+if duplicate_columns:
+    train = train.drop(columns=duplicate_columns)
+
+# Create the 'holiday_flag' column to indicate holidays
+holidays['holiday_flag'] = holidays['type'].apply(lambda x: 1 if x == 'Holiday' else 0)
+
+# Handle transferred holidays: If a holiday was transferred, treat it as a regular day (set flag to 0)
+holidays['holiday_flag'] = holidays.apply(lambda row: 0 if row['transferred'] == True else row['holiday_flag'], axis=1)
+
+# Merge the 'holiday_flag' column from holidays into the train data on 'date'
+train = pd.merge(train, holidays[['date', 'holiday_flag']], on='date', how='left')
+
+# Fill missing values (for non-holiday days) with 0
+train['holiday_flag'] = train['holiday_flag'].fillna(0)
+
+# Merge the oil data into the train dataset on 'date'
+train = pd.merge(train, oil[['date', 'dcoilwtico']], on='date', how='left')
+
+# Fill missing oil prices with forward fill, since oil prices might not be available every day
+train['dcoilwtico'] = train['dcoilwtico'].fillna(method='ffill')
+
+# Ensure that only one 'holiday_flag' column exists
+duplicate_columns = [col for col in train.columns if 'holiday_flag' in col]
+print(f"After merge, 'holiday_flag' columns: {duplicate_columns}")
+
+# Verify the merge worked correctly and 'holiday_flag' and 'dcoilwtico' exist in train data
+print(train[['date', 'holiday_flag', 'dcoilwtico']].head())
+
+# Select only the numeric columns for correlation analysis (including oil prices and holiday flag)
+numeric_columns = train[['sales', 'onpromotion', 'store_nbr', 'dcoilwtico', 'holiday_flag']]
+
+# Compute the correlation matrix for numeric columns
+corr_matrix = numeric_columns.corr()
+
+# Plot the correlation heatmap
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr_matrix, annot=True, fmt='.2f')
+plt.title('Correlation Heatmap')
+plt.show()
+print(f'{train["store_nbr"].nunique()} stores')
+print(f'{train["family"].nunique()} products') 
+
+print(f'{len(train) / 54 / 33:.0f} train days')  
+print(f'Train start date: {train["date"].iloc[0]}')
+print(f'Test end date: {train["date"].iloc[-1]}')
+
+print(f'{len(test) / 54 / 33:.0f} test days')  
+print(f'Test start date: {test["date"].iloc[0]}')
+print(f'Test end date: {test["date"].iloc[-1]}')
+train['date'] = pd.to_datetime(train['date'])
+test['date'] = pd.to_datetime(test['date'])
+oil['date'] = pd.to_datetime(oil['date'])
+holidays['date'] = pd.to_datetime(holidays['date'])
+
+### 1. Date Features
+# Extract date features from the 'date' column
+train['day_of_week'] = train['date'].dt.dayofweek
+train['month'] = train['date'].dt.month
+train['year'] = train['date'].dt.year
+train['is_weekend'] = train['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
+
+test['day_of_week'] = test['date'].dt.dayofweek
+test['month'] = test['date'].dt.month
+test['year'] = test['date'].dt.year
+test['is_weekend'] = test['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
+
+### 2. Holiday Features
+# Drop existing 'is_holiday' columns before merging to avoid conflicts
+if 'is_holiday' in train.columns:
+    train = train.drop(columns=['is_holiday'])
+
+if 'is_holiday' in test.columns:
+    test = test.drop(columns=['is_holiday'])
+
+# Create the 'is_holiday' column in the holidays dataset
+holidays['is_holiday'] = holidays['type'].apply(lambda x: 1 if x == 'Holiday' else 0)
+holidays['is_holiday'] = holidays.apply(lambda row: 0 if row['transferred'] else row['is_holiday'], axis=1)
+
+# Merge holiday data into train and test datasets
+train = pd.merge(train, holidays[['date', 'is_holiday']], on='date', how='left')
+test = pd.merge(test, holidays[['date', 'is_holiday']], on='date', how='left')
+
+# Fill missing values (non-holiday days) with 0
+train['is_holiday'] = train['is_holiday'].fillna(0)
+test['is_holiday'] = test['is_holiday'].fillna(0)
+
+### 3. Oil Price Features
+# Drop existing 'dcoilwtico' columns before merging (to avoid duplicate column issues)
+if 'dcoilwtico' in train.columns:
+    train = train.drop(columns=['dcoilwtico'])
+
+if 'dcoilwtico' in test.columns:
+    test = test.drop(columns=['dcoilwtico'])
+
+# Merge oil price data into train and test datasets
+train = pd.merge(train, oil[['date', 'dcoilwtico']], on='date', how='left')
+test = pd.merge(test, oil[['date', 'dcoilwtico']], on='date', how='left')
+
+# Fill missing oil prices using forward fill
+train['dcoilwtico'] = train['dcoilwtico'].fillna(method='ffill')
+test['dcoilwtico'] = test['dcoilwtico'].fillna(method='ffill')
+
+# Create lagged features and rolling mean for oil prices
+train['oil_price_lag_7'] = train['dcoilwtico'].shift(7)
+train['oil_price_rolling_mean_7'] = train['dcoilwtico'].rolling(window=7).mean()
+
+test['oil_price_lag_7'] = test['dcoilwtico'].shift(7)
+test['oil_price_rolling_mean_7'] = test['dcoilwtico'].rolling(window=7).mean()
+
+# Check the result of the merge
+print(train[['date', 'dcoilwtico']].head())
+print(test[['date', 'dcoilwtico']].head())
+
+### 4. Store Features
+# Ensure 'store_nbr' in train/test is the same dtype as in stores
+train['store_nbr'] = train['store_nbr'].astype(int)
+test['store_nbr'] = test['store_nbr'].astype(int)
+
+# Merge store metadata into train and test datasets
+train = pd.merge(train, stores, on='store_nbr', how='left')
+test = pd.merge(test, stores, on='store_nbr', how='left')
+
+# One-hot encode store features: city, state, type, cluster
+train = pd.get_dummies(train, columns=['city', 'state', 'type', 'cluster'], drop_first=True)
+test = pd.get_dummies(test, columns=['city', 'state', 'type', 'cluster'], drop_first=True)
+
+# Check the result of the merge
+print(train.head())
+
+### 5. Promotion Features
+# Keep the 'onpromotion' feature, and create lagged and rolling mean features
+train['onpromotion_lag_7'] = train['onpromotion'].shift(7)
+train['onpromotion_rolling_mean_7'] = train['onpromotion'].rolling(window=7).mean()
+
+test['onpromotion_lag_7'] = test['onpromotion'].shift(7)
+test['onpromotion_rolling_mean_7'] = test['onpromotion'].rolling(window=7).mean()
+
+# Check the result
+print(train[['onpromotion', 'onpromotion_lag_7', 'onpromotion_rolling_mean_7']].head())
+
+### 6. Handle Missing Values
+# Fill missing values for lagged and rolling mean features with 0 
+# (since missing values in these features may arise from the start of the dataset)
+train = train.fillna(0)
+test = test.fillna(0)
+
+# Final Check for the Train Data
+print(train.isnull().sum())  # Make sure no missing values remain
+
+# Final Check for the Test Data
+print(test.isnull().sum())
+train['date'] = pd.to_datetime(train['date'])
+test['date'] = pd.to_datetime(test['date'])
+
+# Convert categorical features (like 'family') to category type
+train['family'] = train['family'].astype('category')
+test['family'] = test['family'].astype('category')
+
+# Define the train-test split date
+train_test_split_date = '2017-08-01'  # You should replace this with your desired split date
+
+# Step 2: Prepare train and test datasets
+X_train = train[train['date'] < train_test_split_date].drop(['sales', 'date'], axis=1)
+y_train = train[train['date'] < train_test_split_date]['sales']
+
+X_test = train[train['date'] >= train_test_split_date].drop(['sales', 'date'], axis=1)
+y_test = train[train['date'] >= train_test_split_date]['sales']
+
+# Step 3: Create LightGBM datasets
+# Here we pass the categorical features to LightGBM
+categorical_features = ['family']  # You can add more categorical features if present
+
+lgb_train = lgb.Dataset(X_train, label=y_train, categorical_feature=categorical_features)
+lgb_test = lgb.Dataset(X_test, label=y_test, reference=lgb_train)
+
+# Step 4: Define parameters
+params = {
+    'boosting_type': 'gbdt',
+    'objective': 'tweedie',
+    'metric': 'rmse',  # RMSE for training
+    'num_leaves': 31,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.9,
+    'seed': 666
+}
+
+# Step 5: Train the model with early stopping
+num_round = 1000  # Max number of boosting iterations
+callbacks = [lgb.early_stopping(stopping_rounds=50)]  # Callback for early stopping
+
+# Train the model
+bst = lgb.train(params, lgb_train, num_round, valid_sets=[lgb_test], callbacks=callbacks)
+
+# Step 6: Make predictions
+y_pred = bst.predict(X_test, num_iteration=bst.best_iteration)
+
+# Handle negative predictions (if applicable)
+y_pred[y_pred < 0] = 0
+
+# Step 7: Define RMSLE function
+def rmsle(y_true, y_pred):
+    return np.sqrt(mean_squared_log_error(y_true, y_pred))
+
+# Step 8: Calculate and print the RMSLE
+rmsle_error = rmsle(y_test, y_pred)
+print(f'RMSLE: {rmsle_error:.4f}')
+lgb.plot_importance(bst, max_num_features=10)
+plt.show()
+required_rows = 28512
+pred_len = len(y_pred)
+
+# Handle test data row mismatch
+if pred_len < required_rows:
+    # If predictions have fewer rows, pad with zeros
+    y_pred = np.concatenate([y_pred, np.zeros(required_rows - pred_len)])
+elif pred_len > required_rows:
+    # If predictions have more rows, trim the extra ones
+    y_pred = y_pred[:required_rows]
+
+# Create the submission file
+test_predictions = pd.DataFrame({'id': test['id'][:required_rows], 'sales': y_pred})
+
+# Save the submission file
+test_predictions.to_csv('submission8.csv', index=False)
